@@ -1,0 +1,26 @@
+# API y Redis
+fastapi
+uvicorn[standard]
+redis
+httpx
+
+# LangGraph + checkpointer de Redis
+langgraph
+langgraph-checkpoint-redis
+
+# Observabilidad
+langsmith
+
+# Orquestador de la Pre-entrega 6 y RAG de la Pre-entrega 4
+langchain
+langchain-classic
+langchain-core
+langchain-community
+langchain-google-genai
+langchain-huggingface
+langchain-pinecone
+pinecone
+sentence-transformers
+rank_bm25
+pydantic
+python-dotenv
