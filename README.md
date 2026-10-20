@@ -93,16 +93,11 @@ PENDING → RUNNING → WAITING_APPROVAL → (approve) → PENDING → RUNNING �
 - `POST /tasks` solo escribe en Redis y encola: responde en milisegundos, sin esperar al agente.
 - Todo el acceso a Redis usa el cliente asíncrono (`redis.asyncio`) y el grafo se ejecuta con `ainvoke`.
 - Las partes sync se mandan a un thread: la carga del RAG (modelo de embeddings y BM25) al iniciar, la búsqueda del investigador (LangChain ejecuta las herramientas sync en un thread) y la escritura del informe (`asyncio.to_thread`).
-- Los workers corren en el mismo event loop que la API. La cantidad se configura con `WORKERS`: con un plan pago del LLM se pueden procesar varios jobs en paralelo.
+- Los workers corren en el mismo event loop que la API. La cantidad se configura con `WORKERS` (por defecto, `1`). La API recibe y encola pedidos concurrentemente; el worker los procesa de a uno con esta configuración.
 
-### Límite de pedidos al LLM
+### Procesamiento de jobs y cuota del LLM
 
-El plan gratuito de Gemini permite 5 pedidos por minuto por modelo, y cada job hace unas 8 llamadas. En la corrida de carga (con 5 workers y sin limitador), 4 de los 5 jobs terminaron en `FAILED` con `429 RESOURCE_EXHAUSTED` (ver [Lectura del dashboard](#lectura-del-dashboard)).
-
-A partir de ese hallazgo se agregaron dos cambios:
-
-- **Rate limiter:** el LLM usa un `InMemoryRateLimiter` compartido por todos los nodos y workers (`LLM_RPM=4`). Las llamadas esperan su turno en vez de fallar. El costo es más latencia, que en LangSmith aparece dentro de los spans del LLM. Con un plan pago se sube `LLM_RPM` y la latencia baja.
-- **`WORKERS=1` por defecto:** el tiempo total de 5 peticiones es el mismo que con 5 workers (lo fija la cuota del LLM), pero cada job usa el cupo completo y termina antes, mientras los demás esperan en la cola. Con 5 workers, los jobs se reparten el cupo y todos tardan más, lo que sube la latencia p95. Las peticiones siguen siendo concurrentes: la API las recibe a la vez y responde al instante con su `job_id`.
+`WORKERS=1` es el valor predeterminado para evitar que varios jobs llamen al modelo simultáneamente. La API sigue aceptando y encolando peticiones concurrentes, pero un worker procesa los jobs de a uno. Esto **no limita por sí solo** la cantidad de llamadas por minuto: la cuota del proveedor puede seguir causando errores `429 RESOURCE_EXHAUSTED`, como ocurrió en la corrida documentada abajo. Para evitar esos errores se necesita respetar la cuota configurada para la cuenta/modelo o implementar un limitador de llamadas.
 
 ### Redis con dos usos
 
@@ -177,13 +172,14 @@ Envía 5 consultas distintas al mismo tiempo, espera a que lleguen a `WAITING_AP
 
 ## Evidencia en LangSmith
 
-Corrida de carga: 5 peticiones concurrentes con `python scripts/prueba_carga.py --aprobar`, configuración inicial (`WORKERS=5`, sin rate limiter). Las capturas están en `screenshots/`:
+Corrida de carga: 5 peticiones concurrentes con `python scripts/prueba_carga.py --aprobar`, realizada con la configuración inicial (`WORKERS=5`, sin limitador). Las capturas de esa corrida están en `screenshots/`:
 
 | Captura | Qué muestra |
 |---|---|
 | `dashboard.png` | Resumen del proyecto: trazas, tasa de error, llamadas al modelo y a herramientas, tokens y **costo total** |
-| `trazas.png` | Lista de trazas con su estado, error y **latencia** de cada ejecución |
-| `latencia_p99.png` | Latencias P50 y P99 del proyecto, tal como las muestra LangSmith |
+| `traces.png` | Lista de las 6 trazas de la corrida, con estado y latencia; también se ve un error por límite de cuota |
+| `latencia.png` | Percentiles de latencia P50 y P99 que muestra LangSmith |
+| `example_job.png` | Detalle de una ejecución fallida por `GoogleRateLimitError` |
 
 ### Lectura del dashboard
 
@@ -197,15 +193,15 @@ Corrida de carga: 5 peticiones concurrentes con `python scripts/prueba_carga.py 
 | Llamadas a herramientas | 4 (2 `buscar_documentacion_fastapi`, 2 `validar_json_contra_esquema`) |
 | Tokens totales | 18,5K (≈ 1.150 por llamada al LLM) |
 | Costo total | USD 0,07 |
-| Costo por ejecución | ≈ USD 0,014 por petición (0,07 / 5) |
+| Costo promedio por petición enviada | ≈ USD 0,014 (0,07 / 5; promedio derivado, no una métrica individual mostrada en la captura) |
 | Latencia P50 | ≈ 45 s |
-| Latencia p95 (P99 del dashboard) | ≈ 220 s (≈ 3,7 min) |
+| Latencia P99 | ≈ 220 s (≈ 3,7 min), según `latencia.png` |
 
-Las latencias de las trazas fueron 0,07 s, 39,9 s, 45,2 s, 51,2 s, 3,6 min y 4,2 min. LangSmith muestra los percentiles P50 y P99, no el P95. Con solo 6 trazas, el p95 y el p99 caen prácticamente en el mismo punto (el extremo más lento de la distribución), así que se toma el P99 del dashboard como referencia del p95 (`latencia_p99.png`).
+Las latencias de las trazas fueron 0,07 s, 39,9 s, 45,2 s, 51,2 s, 3,6 min y 4,2 min. LangSmith muestra P50 y P99 en la captura disponible, no P95; por eso se informa el P99 sin presentarlo como si fuera el P95 solicitado en la consigna. El dashboard muestra costo total; el promedio por petición de la tabla es un cálculo aproximado a partir del costo total y las cinco peticiones enviadas, no el costo individual de cada ejecución.
 
 **Cómo se comportaron las trazas**
 
-- Las 5 peticiones se recibieron y encolaron al mismo tiempo, y los 5 workers empezaron a procesarlas en paralelo.
+- Las 5 peticiones se recibieron y encolaron al mismo tiempo; en esta corrida inicial, los 5 workers empezaron a procesarlas en paralelo.
 - 4 jobs fallaron con `GoogleRateLimitError` (`429 RESOURCE_EXHAUSTED`, cuota de 5 pedidos por minuto del plan gratuito). El worker capturó la excepción y los dejó en `FAILED` con el error, en lugar de dejarlos colgados en `RUNNING`.
 - 1 job completó el flujo: pasó por investigador y analista (de ahí las 2 llamadas a cada herramienta), se pausó en `aprobacion_humana` y, tras la aprobación, se reanudó y guardó el informe.
 
@@ -220,5 +216,5 @@ Por la estructura del grafo, el **supervisor**: se llama 3 veces por job (antes 
 
 **Mejoras a partir de la lectura**
 
-- Respetar la cuota del LLM con el rate limiter y procesar de a un job (ya aplicado, ver [Límite de pedidos al LLM](#límite-de-pedidos-al-llm)).
+- Respetar la cuota del proveedor o implementar un limitador de llamadas antes de repetir la prueba; `WORKERS=1` reduce la concurrencia de jobs, pero no garantiza por sí solo que no se exceda la cuota.
 - Reducir los tokens del supervisor pasándole un resumen de cada contribución en vez del texto completo.

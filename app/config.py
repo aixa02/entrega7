@@ -29,7 +29,7 @@ RECURSION_LIMIT = 25
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 QUEUE_NAME = "tasks_queue"
 JOB_PREFIX = "job:"
-WORKERS = int(os.getenv("WORKERS", "5"))  # cuántos jobs se procesan en paralelo
+WORKERS = int(os.getenv("WORKERS", "1"))  # cuántos jobs se procesan en paralelo
 
 # --- HITL ---
 INFORMES_DIR = RAIZ / "informes"
